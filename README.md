@@ -51,21 +51,44 @@ If the estimated encoded file is at least **20% smaller** than the original, it 
 
 ```bash
 Usage:
-  ./script.sh [arguments] <folder>
-    List of arguments :
-    -R              : Encode recursively inside subfolders
-    min=X.YZ        : Ignore files smaller than X.YZ GB
-    --regex="PATTERN"        Only include files matching the given regex pattern (e.g., --regex="\.avi$").
-    test=N          : Use N seconds for the test encode (default: 5)
-    --dry-run       : Only show compatible files without encoding
-    --keep-original : Keep original files instead of replacing them
-    --allow-h265    : Allow files already encoded in H.265
-    --allow-av1     : Allow files already encoded in AV1
-    -backup /path   : Save original files to backup path (used only if not using --keep-original)
-    --clean         : Remove temporary encoding files (.tmp_encode_*, .tmp_encode_test_*) from the folder(s, if combined with -R) 
-    --purge         : Remove encoded.list files (.tmp_encode_*, .tmp_encode_test_*) from the folder(s, if combined with -R) 
-    -h              : Show this help message
-    --stop-after HH.5  : Stop after HH.5 hours of encoding (useful if in cron)
+  ./h265-nvidia-batch-encoder.sh [options] <folder>
+
+    --recursive, -R
+            Encode recursively inside subfolders
+    --min=X
+            Ignore files smaller than X GB
+            (example: --min=1)
+            (example: --min=1.75)
+    --regex="PATTERN"
+            Only include files matching the given regex pattern
+            (example: --regex="\.avi$")
+    --test=N
+            Use N seconds for the test encode
+            (default: 5)
+    --dry-run
+            Only show compatible files without encoding
+    --keep-original
+            Keep original files instead of replacing them
+    --allow-h265
+            Allow files already encoded in H.265
+    --allow-av1
+            Allow files already encoded in AV1
+    --backup /path
+            Save original files to backup path
+            (only if not using --keep-original)
+    --clean
+            Remove temporary encoding files (.tmp_encode_*, .tmp_encode_test_*)
+            from the folder(s, if combined with -R)
+    --purge
+            Remove encoded.list files from the folder(s, if combined with -R)
+    --retry
+            Remove failed.list files from the folder(s, if combined with -R)
+    --help, -h
+            Show this help message
+    --stop-after=H
+            Stop after H hours of encoding (useful if in cron)
+            (example: --stop-after=5)
+            (example: --stop-after=5.5)
 
 ```
 ### How it will look

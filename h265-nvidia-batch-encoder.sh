@@ -1,28 +1,58 @@
 #!/bin/bash
 
+# Enable extra globbing. Used in the case statement that parses the
+# command-line
+shopt -s extglob
+
 usage() {
-  echo "
+cat <<EOF
 Supported formats: .mkv .avi .mp4 .mov .wmv .flv
-This script re-encodes video files using hardware-accelerated HEVC (H.265) compression,
-optionally skipping already optimized files and ignoring small files.
+This script re-encodes video files using hardware-accelerated HEVC (H.265)
+compression, optionally skipping already optimized files and ignoring small
+files.
 
 Usage:
-  ./script.sh [-R] [min=X] [test=Y] [--dry-run] [--keep-original] [--allow-h265] [--allow-av1] [-backup /path] <folder>
-    -R              : Encode recursively inside subfolders
-    -min=X.YZ        : Ignore files smaller than X.YZ GB
-    --regex="PATTERN"        Only include files matching the given regex pattern (e.g., --regex="\.avi$").
-    -test=N          : Use N seconds for the test encode (default: 5)
-    --dry-run       : Only show compatible files without encoding
-    -keep-original : Keep original files instead of replacing them
-    -allow-h265    : Allow files already encoded in H.265
-    -allow-av1     : Allow files already encoded in AV1
-    -backup /path   : Save original files to backup path (used only if not using --keep-original)
-    --clean         : Remove temporary encoding files (.tmp_encode_*, .tmp_encode_test_*) from the folder(s, if combined with -R) 
-    --purge         : Remove encoded.list files from the folder(s, if combined with -R) 
-    --retry         : Remove failed.list files from the folder(s, if combined with -R) 
-    -h              : Show this help message
-    -stop-after HH.5  : Stop after HH.5 hours of encoding (useful if in cron)"
-  exit 0
+  ${0} [options] <folder>
+
+    --recursive, -R
+            Encode recursively inside subfolders
+    --min=X
+            Ignore files smaller than X GB
+            (example: --min=1)
+            (example: --min=1.75)
+    --regex="PATTERN"
+            Only include files matching the given regex pattern
+            (example: --regex="\.avi$")
+    --test=N
+            Use N seconds for the test encode
+            (default: 5)
+    --dry-run
+            Only show compatible files without encoding
+    --keep-original
+            Keep original files instead of replacing them
+    --allow-h265
+            Allow files already encoded in H.265
+    --allow-av1
+            Allow files already encoded in AV1
+    --backup /path
+            Save original files to backup path
+            (only if not using --keep-original)
+    --clean
+            Remove temporary encoding files (.tmp_encode_*, .tmp_encode_test_*)
+            from the folder(s, if combined with -R)
+    --purge
+            Remove encoded.list files from the folder(s, if combined with -R)
+    --retry
+            Remove failed.list files from the folder(s, if combined with -R)
+    --help, -h
+            Show this help message
+    --stop-after=H
+            Stop after H hours of encoding (useful if in cron)
+            (example: --stop-after=5)
+            (example: --stop-after=5.5)
+EOF
+# $1 is scoped to usage(), used as an exit-status value if provided.
+exit ${1}
 }
 
 
@@ -123,7 +153,7 @@ MIN_BYTE_PER_SEC=$((MIN_BITRATE * 1000 / 8))
 ##################
 offset_auto=0
 RECURSIVE=0
-raw_min=0
+MIN_SIZE_RAW=0
 MIN_SIZE_BYTES=0
 FOLDER=""
 DRY_RUN=0
@@ -273,25 +303,74 @@ echo "██   ██ ██████   ██████  █████�
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -R) RECURSIVE=1 ; shift ;;
-    min=*) raw_min="${1#min=}"; MIN_SIZE_BYTES=$(echo "$raw_min" | sed 's/,/./' | awk '{printf "%.0f", $1 * 1024 * 1024 * 1024}') ; shift ;;
-    test=*) TEST_DURATION="${1#test=}"; TEST_DURATION=${TEST_DURATION%.*} ; shift ;;
-    --dry-run) DRY_RUN=1 ; shift ;;
-    -keep-original) KEEP_ORIGINAL=1 ; shift ;;
-    -allow-h265) ALLOW_H265=1 ; shift ;;
-    -allow-av1) ALLOW_AV1=1 ; shift ;;
-    -backup) BACKUP_DIR="$2" ; shift 2 ;;
-    --clean) CLEAN_ONLY=1 ; shift ;;
-    --purge) PURGE_ONLY=1 ; shift ;;
-    --retry) RETRY=1 ; shift ;;
-	  -stop-after) STOP_AFTER_HOURS=$(echo "$2" | sed 's/,/./' | awk '{printf "%.0f", $1}'); shift 2 ;;
-    -regex=*) REGEX_FILTER="${1#--regex=}" ; shift ;;
-    -h) usage ;;
-    *) [[ -z "$FOLDER" ]] && FOLDER="$1" || usage; shift ;;
+    --recursive|-R)
+        RECURSIVE=1
+        shift ;;
+    --min=+([0-9.])|min=+([0-9.]))  # no-dash - for compatability with previous behaviour
+        MIN_SIZE_RAW=$(echo ${1#*min=} | awk '{printf "%.2f", $1}')
+        MIN_SIZE_BYTES=$(echo "$MIN_SIZE_RAW" | awk '{printf "%.0f", $1 * 1024 * 1024 * 1024}')
+        shift ;;
+    --test=+([0-9])|test=+([0-9]))  # no-dash - for compatability with previous behaviour
+        TEST_DURATION=$(echo ${1#*test=} | awk '{printf "%.0f", $1}')
+        shift ;;
+    --dry-run)
+        DRY_RUN=1
+        shift ;;
+    --keep-original|-keep-original) # single-dash - for compatability with previous behaviour
+        KEEP_ORIGINAL=1
+        shift ;;
+    --allow-h265|-allow-h265)       # single-dash - for compatability with previous behaviour
+        ALLOW_H265=1
+        shift ;;
+    --allow-av1|-allow-av1)         # single-dash - for compatability with previous behaviour
+        ALLOW_AV1=1
+        shift ;;
+    --backup=*)
+        BACKUP_DIR="${1#--backup=}"
+        shift ;;
+    -backup)                        # single-dash, two args - for compatability with previous behaviour
+        BACKUP_DIR="$2"
+        shift 2 ;;
+    --clean)
+        CLEAN_ONLY=1
+        shift ;;
+    --purge)
+        PURGE_ONLY=1
+        shift ;;
+    --retry)
+        RETRY=1
+        shift ;;
+    --stop-after=+([0-9.]))
+        STOP_AFTER_HOURS=$(echo "${1#--stop-after=}" | awk '{printf "%.2f", $1}')
+        shift ;;
+    -stop-after)                    # single-dash, two args - for compatability with previous behaviour
+        STOP_AFTER_HOURS=$(echo "$2" | sed 's/,/./' | awk '{printf "%.2f", $1}')
+        shift 2 ;;
+    --regex=*|-regex=*)             # single-dash - for compatability with previous behaviour
+        REGEX_FILTER="${1#*regex=}"
+        shift ;;
+    --help|-h)
+        usage 0
+        shift ;;
+    # Catch mal-formed arguments from above
+    # (such as not using =, incorrect characters, etc)
+    --min*|--test*|--regex|-regex)
+        echo -e "❌ Malformed argument: ${1}\n"
+        usage 1
+        shift ;;
+    *)
+        if [[ -z "$FOLDER" ]] then
+            FOLDER="${1}"
+        else
+            echo -e "❌ Bad Argument or too many folders provided: ${1}\n"
+            exit 1
+        fi
+        shift ;;
   esac
 done
 
-[[ -z "$FOLDER" || ! -d "$FOLDER" ]] && { echo "❌ Folder not found or not specified: $FOLDER"; exit 1; }
+[[   -z "$FOLDER" ]] && { echo -e "❌ Folder not specified.\n";   usage 1; }
+[[ ! -d "$FOLDER" ]] && { echo    "❌ Folder not found: $FOLDER"; exit  1; }
 
 
 # =====================
@@ -354,6 +433,7 @@ if (( RETRY > 0 )); then
   exit 0
 fi
 
+
 ############################
 # Startup
 ############################
@@ -379,7 +459,7 @@ print_config() {
 \e[1;33mFolder\e[0m                     ${FOLDER}
 \e[1;33mRecursive\e[0m                  ${RECURSIVE}
 \e[1;33mREGEX Filter\e[0m               ${REGEX_FILTER}
-\e[1;33mMinimum Size\e[0m               ${raw_min} GB
+\e[1;33mMinimum Size\e[0m               ${MIN_SIZE_RAW} GB
 \e[1;33mKeep original\e[0m              ${KEEP_ORIGINAL}
 \e[1;33mStop after\e[0m                 ${STOP_AFTER_HOURS}h
 \e[1;33mAllow H265\e[0m                 ${ALLOW_H265}
