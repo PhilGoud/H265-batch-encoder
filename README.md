@@ -2,7 +2,7 @@
 
 ## 📦 Description
 
-This Bash script scans a folder (optionally recursively) for video files (`*.mkv`, `*.avi`, `*.mp4`, `*.mov`, `*.wmv`, `*.flv`) that are **not** already encoded in HEVC (H.265) or AV1 format. 
+This Bash script scans a folder (optionally recursively) for video files (`*.mkv`, `*.avi`, `*.mp4`, `*.m4v`, `*.mov`, `*.wmv`, `*.flv`, `*.divx`, `*.mpg`, `*.mpeg`) that are **not** already encoded in HEVC (H.265) or AV1 format. 
 
 It performs a **15-second test encoding** to estimate final file size. 
 
@@ -28,9 +28,35 @@ If the estimated encoded file is at least **20% smaller** than the original, it 
 
 ## ⚙️ Requirements
 
+### For NVIDIA GPUs (Linux/Windows)
 - `ffmpeg` compiled with **NVENC** support (NVIDIA GPU encoding)
 - `ffprobe` (usually bundled with ffmpeg)
 - GNU `coreutils` (`stat`, `find`, etc.)
+
+### For Apple Silicon (M1/M2/M3/etc.) Macs
+- `ffmpeg` compiled with **VideoToolbox** support (included in Homebrew builds)
+- `ffprobe` (usually bundled with ffmpeg)
+- macOS 11.0 or later
+
+**Note:** The script automatically detects your platform and selects the appropriate hardware acceleration:
+- **macOS (Apple Silicon/Intel)**: Uses VideoToolbox (`hevc_videotoolbox`)
+- **Linux/Other**: Uses NVIDIA CUDA (`hevc_nvenc`)
+
+You can override the defaults by setting `HWACCEL_TYPE` and `VIDEO_CODEC` environment variables before running the script.
+
+### Installing ffmpeg on macOS
+
+For Apple Silicon Macs, install ffmpeg via Homebrew (includes VideoToolbox support):
+
+```bash
+brew install ffmpeg
+```
+
+To verify VideoToolbox support:
+
+```bash
+ffmpeg -hide_banner -encoders | grep hevc_videotoolbox
+```
 
 ## 🧪 How it works
 

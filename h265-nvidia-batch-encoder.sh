@@ -2,18 +2,19 @@
 
 usage() {
   echo "
-Supported formats: .mkv .avi .mp4 .mov .wmv .flv
+Supported formats: .mkv .avi .mp4 .m4v .mov .wmv .flv .divx .mpg .mpeg
 This script re-encodes video files using hardware-accelerated HEVC (H.265) compression,
 optionally skipping already optimized files and ignoring small files.
 
 Usage:
-  ./script.sh [-R] [min=X] [test=Y] [--dry-run] [--keep-original] [--allow-h265] [--allow-av1] [-backup /path] <folder>
+  ./script.sh [-R] [min=X] [test=Y] [--dry-run] [--check] [--keep-original] [--allow-h265] [--allow-av1] [-backup /path] <folder>
     -R              : Encode recursively inside subfolders
     -min=X.YZ        : Ignore files smaller than X.YZ GB
     --regex="PATTERN"        Only include files matching the given regex pattern (e.g., --regex="\.avi$").
     -test=N          : Use N seconds for the test encode (default: 5)
     -log            : Show ffmpeg log infos when encoding
     --dry-run       : Only show compatible files without encoding
+    --check         : Scan all videos recursively and show compression opportunities sorted by potential savings
     -keep-original : Keep original files instead of replacing them
     -allow-h265    : Allow files already encoded in H.265
     -allow-av1     : Allow files already encoded in AV1
@@ -33,7 +34,32 @@ Usage:
 # ===========================
 
 # Notification env file
-source /scripts/notification.env
+if [[ -f /scripts/notification.env ]]; then
+  source /scripts/notification.env
+fi
+
+# Define send_notif stub if not already defined
+if ! type send_notif &>/dev/null; then
+  send_notif() { :; }  # No-op function
+fi
+
+# Detect platform and set defaults
+if [[ "$(uname)" == "Darwin" ]]; then
+  # macOS detected
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    # Apple Silicon (M1/M2/M3/etc.)
+    DEFAULT_HWACCEL_TYPE="videotoolbox"
+    DEFAULT_VIDEO_CODEC="hevc_videotoolbox"
+  else
+    # Intel Mac
+    DEFAULT_HWACCEL_TYPE="videotoolbox"
+    DEFAULT_VIDEO_CODEC="hevc_videotoolbox"
+  fi
+else
+  # Linux or other - assume NVIDIA CUDA
+  DEFAULT_HWACCEL_TYPE="cuda"
+  DEFAULT_VIDEO_CODEC="hevc_nvenc"
+fi
 
 # Enable hardware acceleration (true/false)
 # true  = use GPU for decoding/encoding (faster, lower CPU usage)
@@ -42,18 +68,20 @@ USE_HWACCEL=true
 
 # Hardware acceleration type
 # Common options:
-# - "cuda"  = NVIDIA GPUs (NVENC)
-# - "vaapi" = Intel/AMD GPUs on Linux
-# - "qsv"   = Intel QuickSync Video
-HWACCEL_TYPE="cuda"
+# - "cuda"         = NVIDIA GPUs (NVENC)
+# - "videotoolbox" = Apple Silicon / macOS (VideoToolbox)
+# - "vaapi"        = Intel/AMD GPUs on Linux
+# - "qsv"          = Intel QuickSync Video
+HWACCEL_TYPE="${HWACCEL_TYPE:-$DEFAULT_HWACCEL_TYPE}"
 
 # Video codec to use for encoding
 # Options:
-# - "hevc_nvenc"  = H.265 with NVIDIA NVENC (requires CUDA)
-# - "libx265"     = H.265 via CPU
-# - "hevc_vaapi"  = H.265 via VAAPI (hardware, Linux)
-# - "hevc_qsv"    = H.265 via Intel QuickSync (hardware)
-VIDEO_CODEC="hevc_nvenc"
+# - "hevc_nvenc"        = H.265 with NVIDIA NVENC (requires CUDA)
+# - "hevc_videotoolbox" = H.265 with Apple VideoToolbox (macOS)
+# - "libx265"           = H.265 via CPU
+# - "hevc_vaapi"        = H.265 via VAAPI (hardware, Linux)
+# - "hevc_qsv"          = H.265 via Intel QuickSync (hardware)
+VIDEO_CODEC="${VIDEO_CODEC:-$DEFAULT_VIDEO_CODEC}"
 
 # Audio codec to use
 # Most compatible option: "aac"
@@ -96,6 +124,9 @@ CQ="30"
 #   "p6"
 #   "p7" = fastest, lower quality
 
+# For hevc_videotoolbox (Apple Silicon / macOS):
+#   No preset option - uses quality parameter instead
+
 # For libx265 (CPU encoder):
 #   "ultrafast", "superfast", "veryfast", "faster", "fast",
 #   "medium" (default), "slow", "slower", "veryslow", "placebo"
@@ -107,7 +138,11 @@ CQ="30"
 # For hevc_qsv (Intel QuickSync):
 #   "veryfast", "faster", "fast", "medium", "slow", "slower"
 
-ENCODE_PRESET="p3"
+if [[ "$VIDEO_CODEC" == "hevc_videotoolbox" ]]; then
+  ENCODE_PRESET=""  # VideoToolbox doesn't use preset
+else
+  ENCODE_PRESET="p3"
+fi
 
 # Duration in seconds for test encoding (used to estimate file size before full encoding)
 # Helps skip files where re-encoding won’t reduce size significantly
@@ -118,7 +153,7 @@ TEST_DURATION=5
 MIN_SIZE_RATIO=0.8
 
 #Skip files below this bitrate (in kbps)
-MIN_BITRATE=2500
+MIN_BITRATE=500
 MIN_BYTE_PER_SEC=$((MIN_BITRATE * 1000 / 8))
 MARK_AS_ENCODED=true
 ENCODE_FAILED=true
@@ -132,6 +167,7 @@ raw_min=0
 MIN_SIZE_BYTES=0
 FOLDER=""
 DRY_RUN=0
+CHECK_MODE=0
 KEEP_ORIGINAL=0
 ALLOW_H265=0
 ALLOW_AV1=0
@@ -217,23 +253,68 @@ build_ffmpeg_command() {
   fi
   
   # ---- Nouveau : filtrer uniquement le flux vidéo principal ----
-  # On récupère le premier flux vidéo qui n’est pas mjpeg
+  # On récupère le premier flux vidéo qui n'est pas mjpeg
   main_video_index=$(ffprobe -v error -select_streams v -show_entries stream=index,codec_name \
                      -of csv=p=0 "$input_file" | grep -v '^.*,mjpeg$' | head -n1 | cut -d',' -f1)
 
   # On mappe uniquement le flux vidéo principal + audio + sous-titres
   map_args=("-map" "0:${main_video_index}" "-map" "0:a?" "-map" "0:s?")
 
-  timeout --foreground "$timeout_limit" \
-  ffmpeg -y "${ffmpeg_opts[@]}" \
-  -fflags +genpts -avoid_negative_ts make_zero \
-  -i "$input_file" \
-  "${map_args[@]}" -hide_banner -loglevel "$LOGLEVEL" "${stats_opts[@]}" \
-  -c:v "$VIDEO_CODEC" -pix_fmt yuv420p -preset "$ENCODE_PRESET" -rc vbr -cq "$cq_value" \
-  -c:a "$AUDIO_CODEC" -b:a "$AUDIO_BITRATE" \
-  -c:s copy \
-  "${container_args[@]}" \
-  "$output_file"
+  # Build codec-specific arguments
+  local codec_args=()
+  if [[ "$VIDEO_CODEC" == "hevc_videotoolbox" ]]; then
+    # VideoToolbox uses q:v instead of cq, and doesn't use preset or rc
+    # q:v range: 0-100 (lower is better quality)
+    # Convert CQ (0-51) to q:v (0-100) approximately
+    local vt_quality=$(awk "BEGIN {printf \"%.0f\", ($cq_value / 51) * 100}")
+    codec_args=("-c:v" "$VIDEO_CODEC" "-q:v" "$vt_quality" "-pix_fmt" "yuv420p")
+  elif [[ "$VIDEO_CODEC" == "hevc_nvenc" ]]; then
+    # NVENC uses preset, rc, and cq
+    codec_args=("-c:v" "$VIDEO_CODEC" "-pix_fmt" "yuv420p" "-preset" "$ENCODE_PRESET" "-rc" "vbr" "-cq" "$cq_value")
+  else
+    # Generic fallback (libx265, hevc_vaapi, hevc_qsv, etc.)
+    if [[ -n "$ENCODE_PRESET" ]]; then
+      codec_args=("-c:v" "$VIDEO_CODEC" "-pix_fmt" "yuv420p" "-preset" "$ENCODE_PRESET" "-cq" "$cq_value")
+    else
+      codec_args=("-c:v" "$VIDEO_CODEC" "-pix_fmt" "yuv420p" "-cq" "$cq_value")
+    fi
+  fi
+
+  # Use timeout if available, otherwise run without timeout
+  if command -v timeout &>/dev/null; then
+    timeout --foreground "$timeout_limit" \
+    ffmpeg -y "${ffmpeg_opts[@]}" \
+    -fflags +genpts -avoid_negative_ts make_zero \
+    -i "$input_file" \
+    "${map_args[@]}" -hide_banner -loglevel "$LOGLEVEL" "${stats_opts[@]}" \
+    "${codec_args[@]}" \
+    -c:a "$AUDIO_CODEC" -b:a "$AUDIO_BITRATE" \
+    -c:s copy \
+    "${container_args[@]}" \
+    "$output_file"
+  elif command -v gtimeout &>/dev/null; then
+    gtimeout --foreground "$timeout_limit" \
+    ffmpeg -y "${ffmpeg_opts[@]}" \
+    -fflags +genpts -avoid_negative_ts make_zero \
+    -i "$input_file" \
+    "${map_args[@]}" -hide_banner -loglevel "$LOGLEVEL" "${stats_opts[@]}" \
+    "${codec_args[@]}" \
+    -c:a "$AUDIO_CODEC" -b:a "$AUDIO_BITRATE" \
+    -c:s copy \
+    "${container_args[@]}" \
+    "$output_file"
+  else
+    # No timeout available, run ffmpeg directly
+    ffmpeg -y "${ffmpeg_opts[@]}" \
+    -fflags +genpts -avoid_negative_ts make_zero \
+    -i "$input_file" \
+    "${map_args[@]}" -hide_banner -loglevel "$LOGLEVEL" "${stats_opts[@]}" \
+    "${codec_args[@]}" \
+    -c:a "$AUDIO_CODEC" -b:a "$AUDIO_BITRATE" \
+    -c:s copy \
+    "${container_args[@]}" \
+    "$output_file"
+  fi
 
 }
 
@@ -278,11 +359,26 @@ echo "██   ██ ██████   ██████  █████�
 
 
 
-[[ "$USE_HWACCEL" == "true" ]] && ! ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q "$HWACCEL_TYPE" && {
-  echo "⚠️  Hardware acceleration type '$HWACCEL_TYPE' not supported. Disabling."
-  USE_HWACCEL=false
-  VIDEO_CODEC="libx265"
-}
+# Validate hardware acceleration support
+if [[ "$USE_HWACCEL" == "true" ]]; then
+  if ! ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q "$HWACCEL_TYPE"; then
+    echo "⚠️  Hardware acceleration type '$HWACCEL_TYPE' not supported. Disabling."
+    USE_HWACCEL=false
+    VIDEO_CODEC="libx265"
+    ENCODE_PRESET="medium"
+  fi
+  
+  # Additional check for VideoToolbox encoder availability
+  if [[ "$VIDEO_CODEC" == "hevc_videotoolbox" ]]; then
+    if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "hevc_videotoolbox"; then
+      echo "⚠️  hevc_videotoolbox encoder not available. Falling back to libx265."
+      VIDEO_CODEC="libx265"
+      ENCODE_PRESET="medium"
+      HWACCEL_TYPE=""
+      USE_HWACCEL=false
+    fi
+  fi
+fi
 
 # =====================
 # Argument Parsing
@@ -295,6 +391,7 @@ while [[ $# -gt 0 ]]; do
     min=*) raw_min="${1#min=}"; MIN_SIZE_BYTES=$(echo "$raw_min" | sed 's/,/./' | awk '{printf "%.0f", $1 * 1024 * 1024 * 1024}') ; shift ;;
     test=*) TEST_DURATION="${1#test=}"; TEST_DURATION=${TEST_DURATION%.*} ; shift ;;
     --dry-run) DRY_RUN=1 ; shift ;;
+    --check) CHECK_MODE=1 ; RECURSIVE=1 ; shift ;;
     -keep-original) KEEP_ORIGINAL=1 ; shift ;;
     -allow-h265) ALLOW_H265=1 ; shift ;;
     -allow-av1) ALLOW_AV1=1 ; shift ;;
@@ -416,7 +513,7 @@ $FOLDER"
 
 find_cmd=(find "$FOLDER")
 [[ $RECURSIVE -eq 0 ]] && find_cmd+=( -maxdepth 1 )
-find_cmd+=( -type f \( -iname '*.mkv' -o -iname '*.avi' -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.flv' \) )
+find_cmd+=( -type f \( -iname '*.mkv' -o -iname '*.avi' -o -iname '*.mp4' -o -iname '*.m4v' -o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.flv' -o -iname '*.divx' -o -iname '*.mpg' -o -iname '*.mpeg' \) )
 
 echo "Scanning..."
 candidates=()
@@ -428,6 +525,10 @@ already_failed=0
 # =====================
 # Scanning and filtering
 # =====================
+
+skipped_low_bitrate=0
+skipped_regex=0
+skipped_too_small=0
 
 while IFS= read -r f; do
   base=$(basename "$f")
@@ -441,12 +542,16 @@ while IFS= read -r f; do
 
   # Apply regex filter if specified
   if [[ -n "$REGEX_FILTER" && ! "$f" =~ $REGEX_FILTER ]]; then
+    skipped_regex=$((skipped_regex + 1))
     continue
   fi
 
   #detect files too small
-  size_bytes=$(stat -c%s "$f" 2>/dev/null) || continue
-  (( MIN_SIZE_BYTES > 0 && size_bytes < MIN_SIZE_BYTES )) && continue
+  size_bytes=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null) || continue
+  if (( MIN_SIZE_BYTES > 0 && size_bytes < MIN_SIZE_BYTES )); then
+    skipped_too_small=$((skipped_too_small + 1))
+    continue
+  fi
   
   #detect already encoded
   if [[ -f "$list_file" ]] && grep -Fxq "$base" "$list_file"; then
@@ -462,8 +567,14 @@ while IFS= read -r f; do
 
   #detect codec
   codec_name=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name -of default=nokey=1:noprint_wrappers=1 "$f" 2>/dev/null) || continue
-  [[ "$codec_name" == "hevc" && $ALLOW_H265 -eq 0 ]] && continue
-  [[ "$codec_name" == "av1" && $ALLOW_AV1 -eq 0 ]] && continue
+  if [[ "$codec_name" == "hevc" && $ALLOW_H265 -eq 0 ]]; then
+    already_encoded=$((already_encoded + 1))
+    continue
+  fi
+  if [[ "$codec_name" == "av1" && $ALLOW_AV1 -eq 0 ]]; then
+    already_encoded=$((already_encoded + 1))
+    continue
+  fi
 
   # Robust duration detection
   duration=$(ffprobe -v error -select_streams v:0 -show_entries format=duration \
@@ -480,7 +591,11 @@ else
   [[ "$duration_int" -gt 0 ]] || duration_int=1
 fi
 
+# Calculate actual bitrate in kbps
+actual_bitrate=$(( (size_bytes * 8) / (duration_int * 1000) ))
+
 if (( size_bytes / duration_int < MIN_BYTE_PER_SEC )); then
+  skipped_low_bitrate=$((skipped_low_bitrate + 1))
   if [ "$MARK_AS_ENCODED" = "true" ]; then
     echo "$base" >> "$list_file"
   fi
@@ -498,11 +613,30 @@ done < <( "${find_cmd[@]}" )
 
   echo -ne "\r├── $all_videos video files found / ${#candidates[@]} will be encoded / $already_encoded indicated as encoded / $already_failed indicated as failed"
   echo ""
+  echo ""
+  echo "📊 Scan Summary:"
+  echo "├── Total videos found: $all_videos"
+  echo "├── Will be encoded: ${#candidates[@]}"
+  echo "├── Already encoded (HEVC/AV1): $already_encoded"
+  echo "├── Previously failed: $already_failed"
+  echo "├── Skipped (low bitrate < ${MIN_BITRATE}kbps): $skipped_low_bitrate"
+  [[ $skipped_too_small -gt 0 ]] && echo "├── Skipped (too small): $skipped_too_small"
+  [[ $skipped_regex -gt 0 ]] && echo "├── Skipped (regex filter): $skipped_regex"
+  echo ""
+  
+  if [[ $skipped_low_bitrate -gt 0 ]]; then
+    echo "💡 TIP: $skipped_low_bitrate file(s) were skipped due to low bitrate."
+    echo "   These files already have bitrate < ${MIN_BITRATE}kbps and are considered well-compressed."
+    echo "   To encode them anyway, you can:"
+    echo "   1. Lower MIN_BITRATE in the script (currently ${MIN_BITRATE}kbps)"
+    echo "   2. Or edit the script and set MARK_AS_ENCODED=false"
+    echo ""
+  fi
 
 if (( DRY_RUN == 1 )); then
   echo -e "\n📝 Compatible files for encoding:"
   for file in "${candidates[@]}"; do
-    size_bytes=$(stat -c%s "$file")
+    size_bytes=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null)
     size_fmt=$(print_size "$size_bytes")
     codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nokey=1:noprint_wrappers=1 "$file")
     duration=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$file")
@@ -510,6 +644,170 @@ if (( DRY_RUN == 1 )); then
     echo "  📆 $(basename "$file") | $size_fmt | $codec | $duration_fmt"
   done
   echo -e "\n✅ ${#candidates[@]} file(s) listed."
+  exit 0
+fi
+
+# =====================
+# CHECK MODE - Analyze compression opportunities
+# =====================
+if (( CHECK_MODE == 1 )); then
+  echo ""
+  echo "🔍 Analyzing compression opportunities..."
+  echo "   This will test-encode a sample of each video to estimate savings."
+  echo ""
+  
+  # Array to store results: "savings_mb|savings_pct|original_size|estimated_size|filepath"
+  declare -a check_results=()
+  
+  total_files=${#candidates[@]}
+  current_file=0
+  
+  for f in "${candidates[@]}"; do
+    current_file=$((current_file + 1))
+    base=$(basename "$f")
+    dir=$(dirname "$f")
+    
+    # Get file info
+    size_bytes=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)
+    codec_name=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name -of default=nokey=1:noprint_wrappers=1 "$f" 2>/dev/null)
+    width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nokey=1:noprint_wrappers=1 "$f" 2>/dev/null)
+    duration=$(ffprobe -v error -select_streams v:0 -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$f" 2>/dev/null)
+    duration="${duration//,/.}"
+    
+    if [[ -z "$duration" || ! "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      duration_int=1
+    else
+      duration_int=${duration%.*}
+      [[ "$duration_int" -gt 0 ]] || duration_int=1
+    fi
+    
+    # Determine CQ value
+    if [[ -n "$width" && "$width" =~ ^[0-9]+$ ]]; then
+      if (( width >= CQ_WIDTH_THRESHOLD )); then
+        file_CQ="$CQ_HD"
+      else
+        file_CQ="$CQ_SD"
+      fi
+    else
+      file_CQ="$CQ"
+    fi
+    
+    echo -ne "\r[$current_file/$total_files] Testing: $(basename "$f")...                    "
+    
+    # Perform test encoding (use middle of video)
+    offset=$(( duration_int / 2 ))
+    tmp_test="$dir/.tmp_check_test_${base}"
+    
+    # Build ffmpeg command for test
+    ffmpeg_opts=()
+    [[ "$USE_HWACCEL" == "true" && -n "$HWACCEL_TYPE" ]] && ffmpeg_opts+=("-hwaccel" "$HWACCEL_TYPE")
+    
+    codec_args=()
+    if [[ "$VIDEO_CODEC" == "hevc_videotoolbox" ]]; then
+      vt_quality=$(awk "BEGIN {printf \"%.0f\", ($file_CQ / 51) * 100}")
+      codec_args=("-c:v" "$VIDEO_CODEC" "-q:v" "$vt_quality" "-pix_fmt" "yuv420p")
+    elif [[ "$VIDEO_CODEC" == "hevc_nvenc" ]]; then
+      codec_args=("-c:v" "$VIDEO_CODEC" "-pix_fmt" "yuv420p" "-preset" "$ENCODE_PRESET" "-rc" "vbr" "-cq" "$file_CQ")
+    else
+      if [[ -n "$ENCODE_PRESET" ]]; then
+        codec_args=("-c:v" "$VIDEO_CODEC" "-pix_fmt" "yuv420p" "-preset" "$ENCODE_PRESET" "-cq" "$file_CQ")
+      else
+        codec_args=("-c:v" "$VIDEO_CODEC" "-pix_fmt" "yuv420p" "-cq" "$file_CQ")
+      fi
+    fi
+    
+    # Run test encoding
+    ffmpeg -y "${ffmpeg_opts[@]}" \
+      -ss "$offset" -t "$TEST_DURATION" \
+      -i "$f" \
+      -map 0:v:0 -map 0:a? \
+      -hide_banner -loglevel error \
+      "${codec_args[@]}" \
+      -c:a "$AUDIO_CODEC" -b:a "$AUDIO_BITRATE" \
+      -f mp4 \
+      "$tmp_test" 2>/dev/null
+    
+    if [[ -f "$tmp_test" ]]; then
+      test_size=$(stat -f%z "$tmp_test" 2>/dev/null || stat -c%s "$tmp_test" 2>/dev/null)
+      rm -f "$tmp_test"
+      
+      # Estimate full file size
+      if (( test_size > 0 )); then
+        estimated_size=$(( (test_size * duration_int) / TEST_DURATION ))
+        
+        # Calculate savings
+        if (( estimated_size < size_bytes )); then
+          savings_bytes=$(( size_bytes - estimated_size ))
+          savings_mb=$(awk "BEGIN {printf \"%.2f\", $savings_bytes / 1024 / 1024}")
+          savings_pct=$(awk "BEGIN {printf \"%.1f\", ($savings_bytes * 100.0) / $size_bytes}")
+          
+          # Store result
+          check_results+=("$savings_mb|$savings_pct|$size_bytes|$estimated_size|$f")
+        fi
+      fi
+    fi
+  done
+  
+  echo -ne "\r                                                                                \r"
+  
+  # Sort results by savings (descending)
+  IFS=$'\n' sorted_results=($(sort -t'|' -k1 -rn <<<"${check_results[*]}"))
+  unset IFS
+  
+  # Display results
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "🎯 COMPRESSION OPPORTUNITIES (sorted by potential savings)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  
+  if [[ ${#sorted_results[@]} -eq 0 ]]; then
+    echo "❌ No compression opportunities found."
+    echo "   All videos are already well-compressed or would not benefit from re-encoding."
+    echo ""
+    exit 0
+  fi
+  
+  total_savings_bytes=0
+  rank=1
+  
+  printf "%-4s %-8s %-8s %-12s %-12s %s\n" "Rank" "Savings" "%" "Original" "Estimated" "File"
+  printf "%-4s %-8s %-8s %-12s %-12s %s\n" "----" "--------" "--------" "------------" "------------" "----"
+  
+  for result in "${sorted_results[@]}"; do
+    IFS='|' read -r savings_mb savings_pct orig_size est_size filepath <<< "$result"
+    
+    orig_fmt=$(print_size "$orig_size")
+    est_fmt=$(print_size "$est_size")
+    filename=$(basename "$filepath")
+    
+    # Truncate filename if too long
+    if [[ ${#filename} -gt 60 ]]; then
+      filename="${filename:0:57}..."
+    fi
+    
+    printf "%-4d %-8s %-8s %-12s %-12s %s\n" \
+      "$rank" \
+      "${savings_mb}MB" \
+      "${savings_pct}%" \
+      "$orig_fmt" \
+      "$est_fmt" \
+      "$filename"
+    
+    total_savings_bytes=$(awk "BEGIN {printf \"%.0f\", $total_savings_bytes + ($orig_size - $est_size)}")
+    rank=$((rank + 1))
+  done
+  
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  total_savings_fmt=$(print_size "$total_savings_bytes")
+  echo "💾 TOTAL POTENTIAL SAVINGS: $total_savings_fmt across ${#sorted_results[@]} file(s)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "💡 To encode these files, run:"
+  echo "   ./$(basename "$0") -R \"$FOLDER\""
+  echo ""
+  
   exit 0
 fi
 
@@ -532,7 +830,7 @@ for f in "${candidates[@]}"; do
   dir=$(dirname "$f")
   list_file="$dir/encoded.list"
   failed_file="$dir/failed.list"
-  size_bytes=$(stat -c%s "$f")
+  size_bytes=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null)
   height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null)
   channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$f")
   
@@ -591,8 +889,8 @@ for f in "${candidates[@]}"; do
 
   ext="${base##*.}"
   ext_lower=$(echo "$ext" | tr 'A-Z' 'a-z')
-  output_ext="$ext_lower"
-  [[ "$ext_lower" == "avi" || "$ext_lower" == "mp4" ]] && output_ext="mkv"
+  # Convert all to MP4 for maximum compatibility
+  output_ext="mp4"
   tmp_file="$dir/.tmp_encode_${base%.*}.$output_ext"
   tmp_test="$dir/.tmp_encode_test_${base}"
 
@@ -655,7 +953,7 @@ for offset_auto in "${offsets[@]}"; do
     break
   fi
 
-  test_size=$(stat -c%s "$tmp_test")
+  test_size=$(stat -f%z "$tmp_test" 2>/dev/null || stat -c%s "$tmp_test" 2>/dev/null)
   test_sizes+=("$test_size")
   rm -f "$tmp_test"
 done
@@ -777,7 +1075,7 @@ fi
 
 echo "🎥  Video file replacement"
 
-  new_size=$(stat -c%s "$tmp_file")
+  new_size=$(stat -f%z "$tmp_file" 2>/dev/null || stat -c%s "$tmp_file" 2>/dev/null)
   if (( new_size < size_bytes )); then
     if (( KEEP_ORIGINAL == 1 )); then
       mv -f "$tmp_file" "${f%.*}_encoded.$output_ext"
